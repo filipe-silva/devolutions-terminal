@@ -38,6 +38,127 @@ public sealed class TermControlInputSourceTests
     }
 
     [AvaloniaFact]
+    public async Task AFingerDragScrollsAsTheWheelDoes()
+    {
+        var connection = new SourceAwareConnection();
+        var control = new TermControl { ConnectionFactory = _ => connection };
+        await control.StartAsync(new ProfileSettings { Commandline = "cmd.exe" }, 20, 3);
+        try
+        {
+            // Plain output: dragging down brings earlier lines into view, and sends nothing.
+            control.Engine.Feed("1\r\n2\r\n3\r\n4\r\n5\r\n6");
+            control.TouchScroll(2, default);
+            Assert.Equal(2, control.Engine.ScrollOffset);
+            control.TouchScroll(-2, default);
+            Assert.Equal(0, control.Engine.ScrollOffset);
+            Assert.Equal("", connection.WrittenText);
+
+            // A full-screen program gets arrow keys, one per line: down for earlier lines is up.
+            control.Engine.Feed($"{Esc}[?1049h");
+            control.TouchScroll(2, default);
+            Assert.Equal($"{Esc}[A{Esc}[A", connection.WrittenText);
+
+            // A program that tracks the mouse gets wheel events instead (64: up, 65: down).
+            control.Engine.Feed($"{Esc}[?1000h{Esc}[?1006h");
+            control.TouchScroll(-1, default);
+            Assert.EndsWith($"{Esc}[<65;1;1M", connection.WrittenText);
+        }
+        finally
+        {
+            await control.CloseAsync();
+        }
+    }
+
+    [AvaloniaFact]
+    public async Task ATapIsAClickForAProgramThatTracksTheMouseAndNothingElse()
+    {
+        var connection = new SourceAwareConnection();
+        var control = new TermControl { ConnectionFactory = _ => connection };
+        await control.StartAsync(new ProfileSettings { Commandline = "cmd.exe" }, 20, 3);
+        try
+        {
+            control.TouchTap(default);
+            Assert.Equal("", connection.WrittenText);
+
+            control.Engine.Feed($"{Esc}[?1000h{Esc}[?1006h");
+            control.TouchTap(default);
+            Assert.Equal($"{Esc}[<0;1;1M{Esc}[<0;1;1m", connection.WrittenText);
+        }
+        finally
+        {
+            await control.CloseAsync();
+        }
+    }
+
+    [AvaloniaFact]
+    public async Task HoldingAFingerSelectsAWordEvenInAProgramThatTracksTheMouse()
+    {
+        var connection = new SourceAwareConnection();
+        var control = new TermControl { ConnectionFactory = _ => connection };
+        await control.StartAsync(new ProfileSettings { Commandline = "cmd.exe" }, 20, 3);
+        try
+        {
+            control.Engine.Feed($"hello world{Esc}[?1000h{Esc}[?1006h");
+            control.TouchHold(default);
+            Assert.True(control.HasSelection);
+            Assert.Equal("", connection.WrittenText);
+        }
+        finally
+        {
+            await control.CloseAsync();
+        }
+    }
+
+    // The steps below are the ones Avalonia's Android keyboard bridge takes (TextEditBuffer.Replace and
+    // Remove): select the old text, a forward delete, then the new text, then a caret after it.
+    [AvaloniaFact]
+    public async Task AKeyboardSuggestionReplacesTheWordItTyped()
+    {
+        var connection = new SourceAwareConnection();
+        var control = new TermControl { ConnectionFactory = _ => connection };
+        await control.StartAsync(new ProfileSettings { Commandline = "cmd.exe" }, 40, 3);
+        var ime = control.TextInputClient;
+        ime.TracksTyping = true;
+        try
+        {
+            Assert.True(control.ImeTextInput("helo"));
+            Assert.Equal("helo", ime.SurroundingText);
+
+            // The suggestion "hello" over the composing word: only what differs goes back and comes again.
+            ime.Selection = new Avalonia.Input.TextInput.TextSelection(0, 4);
+            Assert.True(control.ImeKeyDown(Avalonia.Input.Key.Delete, Avalonia.Input.KeyModifiers.None));
+            Assert.True(control.ImeTextInput("hello"));
+            ime.Selection = new Avalonia.Input.TextInput.TextSelection(5, 5);
+            Assert.Equal("helo\u007flo", connection.WrittenText);
+            Assert.Equal("hello", ime.SurroundingText);
+
+            // deleteSurroundingText then commitText: the delete goes as soon as the caret moves.
+            ime.Selection = new Avalonia.Input.TextInput.TextSelection(0, 5);
+            Assert.True(control.ImeKeyDown(Avalonia.Input.Key.Delete, Avalonia.Input.KeyModifiers.None));
+            ime.Selection = new Avalonia.Input.TextInput.TextSelection(0, 0);
+            Assert.True(control.ImeTextInput("hi"));
+            Assert.Equal("helo\u007flo\u007f\u007f\u007f\u007f\u007fhi", connection.WrittenText);
+            Assert.Equal("hi", ime.SurroundingText);
+
+            // A delete on its own goes once the keyboard is done.
+            ime.Selection = new Avalonia.Input.TextInput.TextSelection(1, 2);
+            Assert.True(control.ImeKeyDown(Avalonia.Input.Key.Delete, Avalonia.Input.KeyModifiers.None));
+            Avalonia.Threading.Dispatcher.UIThread.RunJobs();
+            Assert.EndsWith("hi\u007f", connection.WrittenText);
+            Assert.Equal("h", ime.SurroundingText);
+
+            // Any other key starts again from nothing, and a plain delete is a delete.
+            Assert.False(control.ImeKeyDown(Avalonia.Input.Key.Left, Avalonia.Input.KeyModifiers.None));
+            Assert.Equal("", ime.SurroundingText);
+            Assert.False(control.ImeKeyDown(Avalonia.Input.Key.Delete, Avalonia.Input.KeyModifiers.None));
+        }
+        finally
+        {
+            await control.CloseAsync();
+        }
+    }
+
+    [AvaloniaFact]
     public async Task RepliesStillReachAConnectionThatDoesNotTellSourcesApart()
     {
         var connection = new PlainConnection();

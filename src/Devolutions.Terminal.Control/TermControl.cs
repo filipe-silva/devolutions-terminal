@@ -74,6 +74,12 @@ public sealed class TermControl : Avalonia.Controls.Control
     private TerminalCompositionOverlay? _composition;
     private readonly TerminalTextInputMethodClient _textInputMethodClient;
     private Point? _touchPoint;
+    private bool _touchSelecting;
+    private readonly DispatcherTimer _touchHoldTimer;
+    private const double TouchSlop = 12;
+
+    /// <summary>The finger has scrolled since it touched down: lifting it is then no tap.</summary>
+    private bool _touchScrolled;
     private string _accessibleName = "Terminal";
     private int _pressedMouseButton = -1;
     private long _selectionCoordinateVersion;
@@ -165,6 +171,18 @@ public sealed class TermControl : Avalonia.Controls.Control
 
         _ptyResizeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(32) };
         _ptyResizeTimer.Tick += (_, _) => FlushPtyResize();
+        _touchHoldTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
+        _touchHoldTimer.Tick += (_, _) =>
+        {
+            if (_touchPoint is { } held && !_touchScrolled)
+            {
+                TouchHold(held);
+            }
+            else
+            {
+                _touchHoldTimer.Stop();
+            }
+        };
         _blinkTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(530) };
         _blinkTimer.Tick += (_, _) =>
         {
@@ -2039,6 +2057,13 @@ public sealed class TermControl : Avalonia.Controls.Control
             return;
         }
 
+        if (ImeKeyDown(e.Key, e.KeyModifiers))
+        {
+            e.Handled = true;
+            base.OnKeyDown(e);
+            return;
+        }
+
         var vt = ProcessKeyDownInput(
             e.Key,
             e.KeyModifiers,
@@ -2101,8 +2126,74 @@ public sealed class TermControl : Avalonia.Controls.Control
         return vt;
     }
 
+    /// <summary>
+    /// A key, as the keyboard's record of what it typed sees it: a forward delete over what the keyboard
+    /// selected is that edit (true: nothing else to send), a backspace takes the last character off the
+    /// record, and any other key starts the record again.
+    /// </summary>
+    internal bool ImeKeyDown(Key key, KeyModifiers modifiers)
+    {
+        if (modifiers == KeyModifiers.None && key == Key.Delete && _textInputMethodClient.DeletingSelection())
+        {
+            return true;
+        }
+
+        if (modifiers == KeyModifiers.None && key == Key.Back)
+        {
+            _textInputMethodClient.Backspaced();
+        }
+        else
+        {
+            _textInputMethodClient.Forget();
+        }
+
+        return false;
+    }
+
+    /// <summary>Text from the keyboard: typed in place of what the keyboard selected, when it keeps a record.</summary>
+    internal bool ImeTextInput(string? text)
+    {
+        if (string.IsNullOrEmpty(text) ||
+            text is "\r" or "\n" or "\t" ||
+            _suppressOptionTextInput ||
+            _suppressEncodedKeyTextInput ||
+            string.Equals(_pendingEncodedTextInput, text, StringComparison.Ordinal))
+        {
+            // A key already sent this, or it is no text: the key path has it.
+            _textInputMethodClient.Forget();
+            return false;
+        }
+
+        return _textInputMethodClient.Typing(text);
+    }
+
+    /// <summary>An edit the keyboard made: backspaces, then text, each encoded as the program asked.</summary>
+    internal void SendImeEdit(int backspaces, string text)
+    {
+        var mode = Engine.InputMode;
+        for (var i = 0; i < backspaces; i++)
+        {
+            ProcessKeyDownInput(Key.Back, KeyModifiers.None, PhysicalKey.Backspace, null, mode);
+            ProcessKeyUpInput(Key.Back, KeyModifiers.None, PhysicalKey.Backspace, null, mode);
+        }
+
+        if (text.Length > 0)
+        {
+            ProcessTextInput(text, mode);
+        }
+    }
+
+    internal TerminalTextInputMethodClient TextInputClient => _textInputMethodClient;
+
     protected override void OnTextInput(TextInputEventArgs e)
     {
+        if (ImeTextInput(e.Text))
+        {
+            e.Handled = true;
+            base.OnTextInput(e);
+            return;
+        }
+
         if (ProcessTextInput(e.Text, Engine.InputMode) is not null)
         {
             e.Handled = true;
@@ -2309,6 +2400,12 @@ public sealed class TermControl : Avalonia.Controls.Control
         if (e.Pointer.Type == PointerType.Touch)
         {
             _touchPoint = point.Position;
+            _touchScrolled = false;
+            _touchSelecting = false;
+            ClearSelection();
+            _touchHoldTimer.Stop();
+            _touchHoldTimer.Start();
+            _textInputMethodClient.Forget();
             e.Pointer.Capture(this);
             e.Handled = true;
             base.OnPointerPressed(e);
@@ -2438,14 +2535,30 @@ public sealed class TermControl : Avalonia.Controls.Control
             return;
         }
 
+        if (_touchSelecting)
+        {
+            var (x, y) = HitTest(e.GetPosition(this));
+            UpdateSelection(x, y);
+            e.Handled = true;
+            base.OnPointerMoved(e);
+            return;
+        }
+
         if (_touchPoint is { } previous)
         {
             var current = e.GetPosition(this);
-            var rows = (int)Math.Truncate((previous.Y - current.Y) / Math.Max(1, _cellHeight));
+            if (Math.Abs(current.X - previous.X) + Math.Abs(current.Y - previous.Y) > TouchSlop)
+            {
+                _touchHoldTimer.Stop();
+            }
+
+            // The content follows the finger: dragging down brings earlier lines into view, as on any touch screen.
+            var rows = (int)Math.Truncate((current.Y - previous.Y) / Math.Max(1, _cellHeight));
             if (rows != 0)
             {
-                ScrollBy(rows);
+                TouchScroll(rows, current);
                 _touchPoint = current;
+                _touchScrolled = true;
             }
 
             e.Handled = true;
@@ -2489,6 +2602,22 @@ public sealed class TermControl : Avalonia.Controls.Control
             _pressedMouseButton = -1;
         }
 
+        _touchHoldTimer.Stop();
+        if (_touchSelecting)
+        {
+            _touchSelecting = false;
+            _touchPoint = null;
+            TouchHoldEnded();
+            e.Pointer.Capture(null);
+            base.OnPointerReleased(e);
+            return;
+        }
+
+        if (e.Pointer.Type == PointerType.Touch && _touchPoint is not null && !_touchScrolled)
+        {
+            TouchTap(e.GetPosition(this));
+        }
+
         _touchPoint = null;
         EndSelection();
         e.Pointer.Capture(null);
@@ -2506,6 +2635,84 @@ public sealed class TermControl : Avalonia.Controls.Control
         }
 
         _suppressPointerContextRequest = false;
+    }
+
+    /// <summary>
+    /// A finger drag of <paramref name="rows"/> lines (positive: towards earlier lines), handled as the wheel
+    /// is: a program that tracks the mouse gets wheel events, a full-screen program (alternate buffer) gets
+    /// arrow keys, anything else scrolls the scrollback. Otherwise a program that draws its own screen could
+    /// not be scrolled from a touch screen at all.
+    /// </summary>
+    internal void TouchScroll(int rows, Point position)
+    {
+        var earlier = rows > 0;
+        var steps = Math.Abs(rows);
+        if (Engine.MouseTracking)
+        {
+            var (x, y) = HitTest(position);
+            for (var i = 0; i < steps; i++)
+            {
+                WriteMouseInput(earlier ? 64 : 65, x, y, released: false, KeyModifiers.None);
+            }
+
+            return;
+        }
+
+        if (Engine.AlternateBufferActive)
+        {
+            var sequence = Engine.ApplicationCursorKeys
+                ? (earlier ? "\u001bOA" : "\u001bOB")
+                : (earlier ? "\u001b[A" : "\u001b[B");
+            for (var i = 0; i < steps; i++)
+            {
+                TryWriteInput(sequence);
+            }
+
+            return;
+        }
+
+        ScrollBy(rows);
+    }
+
+    /// <summary>
+    /// A finger lifted where it touched down (without scrolling a line): a left click there, for a program
+    /// that tracks the mouse, so what it draws to be clicked (a link, a "jump to bottom") answers a tap.
+    /// Anything else keeps the tap as it was: focus, nothing typed.
+    /// </summary>
+    internal void TouchTap(Point position)
+    {
+        if (!Engine.MouseTracking)
+        {
+            return;
+        }
+
+        var (x, y) = HitTest(position);
+        WriteMouseInput(0, x, y, released: false, KeyModifiers.None);
+        WriteMouseInput(0, x, y, released: true, KeyModifiers.None);
+    }
+
+    /// <summary>
+    /// A finger held still: selects the word under it, here and never in the program, even one that tracks
+    /// the mouse (on a touch screen there is no Shift to hold); dragging on then extends the selection.
+    /// </summary>
+    internal void TouchHold(Point position)
+    {
+        _touchHoldTimer.Stop();
+        _touchSelecting = true;
+        var (x, y) = HitTest(position);
+        BeginSelection(x, y, TerminalSelectionMode.Word);
+    }
+
+    /// <summary>The finger that selected lifts: the selection stays shown, and is copied (a phone has no Ctrl+C).</summary>
+    internal void TouchHoldEnded()
+    {
+        _selecting = false;
+        if (_selection is null)
+        {
+            return;
+        }
+
+        ObserveInteractionAsync("copy", CopyAsync(InteractionOptions.Copy));
     }
 
     protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
