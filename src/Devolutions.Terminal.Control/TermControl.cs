@@ -2035,6 +2035,65 @@ public sealed class TermControl : Avalonia.Controls.Control
             overlays,
             padding: (float)_padding.Left,
             drawCursor: Engine.CursorVisible && (_cursorOn || !IsFocused)));
+
+        if (_magnifierAt is { } at && MagnifierLens(at) is { } lens)
+        {
+            // The same frame again, scaled about the finger into the lens: what the finger covers, readable.
+            var round = new RoundedRect(lens, 8);
+            using (context.PushClip(round))
+            using (context.PushTransform(
+                       Matrix.CreateTranslation(-at.X, -at.Y) *
+                       Matrix.CreateScale(MagnifierScale, MagnifierScale) *
+                       Matrix.CreateTranslation(lens.Center.X, lens.Center.Y)))
+            {
+                context.Custom(new TerminalSkiaDrawOperation(
+                    new Rect(Bounds.Size),
+                    _renderer,
+                    frame,
+                    overlays,
+                    padding: (float)_padding.Left,
+                    drawCursor: false));
+            }
+
+            context.DrawRectangle(null, MagnifierPen, round);
+        }
+    }
+
+    private const double MagnifierScale = 1.5;
+    private static readonly Pen MagnifierPen = new(new SolidColorBrush(Color.FromArgb(170, 128, 128, 128)), 1.5);
+    private Point? _magnifierAt;
+
+    /// <summary>Where a finger selecting text is, for the magnifier; null when none is.</summary>
+    internal Point? MagnifierAt => _magnifierAt;
+
+    /// <summary>
+    /// The magnifier's place: a few lines tall, centred over the finger and above it, clear of it, or below
+    /// it when there is no room above; inside the control either way.
+    /// </summary>
+    internal Rect? MagnifierLens(Point at)
+    {
+        var width = Math.Min(Bounds.Width - 16, Math.Max(_cellWidth * 14, 160));
+        var height = Math.Max(_cellHeight, 8) * 2.4 * MagnifierScale;
+        if (width < 40 || height > Bounds.Height / 2)
+        {
+            return null;
+        }
+
+        const double gap = 56;
+        var x = Math.Clamp(at.X - (width / 2), 8, Bounds.Width - width - 8);
+        var y = at.Y - gap - height;
+        if (y < 8)
+        {
+            y = Math.Min(at.Y + gap, Bounds.Height - height - 8);
+        }
+
+        return new Rect(x, y, width, height);
+    }
+
+    private void MoveMagnifier(Point? at)
+    {
+        _magnifierAt = at;
+        InvalidateVisual();
     }
 
     public void SetSearchHighlights(IReadOnlyList<TerminalCellRange> highlights)
@@ -2539,6 +2598,7 @@ public sealed class TermControl : Avalonia.Controls.Control
         {
             var (x, y) = HitTest(e.GetPosition(this));
             UpdateSelection(x, y);
+            MoveMagnifier(e.GetPosition(this));
             e.Handled = true;
             base.OnPointerMoved(e);
             return;
@@ -2701,12 +2761,14 @@ public sealed class TermControl : Avalonia.Controls.Control
         _touchSelecting = true;
         var (x, y) = HitTest(position);
         BeginSelection(x, y, TerminalSelectionMode.Word);
+        MoveMagnifier(position);
     }
 
     /// <summary>The finger that selected lifts: the selection stays shown, and is copied (a phone has no Ctrl+C).</summary>
     internal void TouchHoldEnded()
     {
         _selecting = false;
+        MoveMagnifier(null);
         if (_selection is null)
         {
             return;

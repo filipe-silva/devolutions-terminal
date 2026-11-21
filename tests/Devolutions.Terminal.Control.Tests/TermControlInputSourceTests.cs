@@ -102,6 +102,11 @@ public sealed class TermControlInputSourceTests
             control.TouchHold(default);
             Assert.True(control.HasSelection);
             Assert.Equal("", connection.WrittenText);
+
+            // A magnifier follows the finger while it selects, and goes when it lifts.
+            Assert.NotNull(control.MagnifierAt);
+            control.TouchHoldEnded();
+            Assert.Null(control.MagnifierAt);
         }
         finally
         {
